@@ -1,9 +1,12 @@
 """
+QMC5883L 3-Axis Magnetic Sensor CircuitPython I2C Driver
+
 https://github.com/owings1/qmc5883l_circuitpython
 
-QMC5883L 3-Axis Magnetic Sensor CircuitPython I2C Driver Implementation
+* Author: Doug Owings
+* License: MIT License
 
-Copyright (C) 2026 Doug Owings
+Copyright (C) 2026 Doug Owings. All rights reserved.
 
 Permission is hereby granted, free of charge, to any person obtaining
 a copy of this software and associated documentation files (the
@@ -23,6 +26,23 @@ NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
 LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
 OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+======================================================================
+
+Dependencies:
+
+* Adafruit's Bus Device library:
+  https://github.com/adafruit/Adafruit_CircuitPython_BusDevice
+
+* Adafruit's Register library:
+  https://github.com/adafruit/Adafruit_CircuitPython_Register
+
+Resources:
+
+* Hardware Datasheet:
+  https://www.qstcorp.com/upload/pdf/202202/%EF%BC%88%E5%B7%B2%E4%BC%A0%EF%BC%8913-52-04%20QMC5883L%20Datasheet%20Rev.%20A(1).pdf
+
+* Adafruit CircuitPython:
+  https://circuitpython.org/downloads
 """
 from __future__ import annotations
 
@@ -38,8 +58,11 @@ try:
 except ImportError:
   pass
 
-MICROTESLAS_PER_GAUSS = const(100)
+__version__ = '0.0.2'
+__repo__ = 'https://github.com/owings1/qmc5883l_circuitpython'
+
 QMC5883L_DEFAULT_ADDRESS = const(0x0D)
+QMC5883L_CHIP_ID = const(0xFF)
 
 # Oversampling
 OSR_512 = const(0x00)
@@ -47,10 +70,10 @@ OSR_256 = const(0x01)
 OSR_128 = const(0x02)
 OSR_64 = const(0x03)
 
-# Range
+# Range/Gain
 RANGE_2G = const(0x00)
 RANGE_8G = const(0x01)
-SENSITIVITY_VALUES = const((12_000, 3_000))
+GAIN_VALUES = const((12_000, 3_000))
 
 # Output Data Rate
 ODR_10HZ = const(0x00)
@@ -81,16 +104,15 @@ CTRL2_SOFT_RST_BIT = const(0x07)
 CTRL2_ROL_PNT_BIT = const(0x06)
 CTRL2_INT_ENB_BIT = const(0x00)
 
-_DATA_FORMAT = '<3h'
-_TOUT_FORMAT = '<H'
+_DATA_FORMAT = const('<3h')
+_TOUT_FORMAT = const('<H')
 
-_DEFAULT_CONFIG = (
-  (OSR_512 << CTRL1_OSR_LOWEST_BIT) |
-  (RANGE_8G << CTRL1_RANGE_LOWEST_BIT) |
-  (ODR_200HZ << CTRL1_ODR_LOWEST_BIT) |
-  (MODE_CONTINUOUS << CTRL1_MODE_LOWEST_BIT))
-
-_SETUP_CMD = struct.pack('2B', _FBR_REGISTER, 0x01)
+FLAG_CALIBRATED = const(0x40)
+_STATUS_IDX = const(0x07)
+_FLAGS_IDX = const(0x08)
+_CALIB_IDX = const(0x09)
+_DEFAULT_CONFIG = const(0b10001) # OSR_512, RANGE_8G, ODR_200HZ, MODE_CONTINUOUS
+_SETUP_CMD = const(b'\x0b\x01')
 
 class QMC5883L:
   osr = RWBits(2, _CTRL1_REGISTER, CTRL1_OSR_LOWEST_BIT)
@@ -107,11 +129,19 @@ class QMC5883L:
   _int_enb = RWBits(1, _CTRL2_REGISTER, CTRL2_INT_ENB_BIT)
   _do_soft_reset = RWBits(1, _CTRL2_REGISTER, CTRL2_SOFT_RST_BIT)
 
-  def __init__(self, i2c: I2C, address: int = QMC5883L_DEFAULT_ADDRESS) -> None:
+  def __init__(self, i2c: I2C, address: int = QMC5883L_DEFAULT_ADDRESS, verify: bool = True) -> None:
     self.i2c_device = I2CDevice(i2c, address)
-    self.buf = bytearray(1 + struct.calcsize(_DATA_FORMAT))
+    # Buffer: [Reg] + [6 Data] + [Status] + [Flags] + [12 Calibration] = 21 bytes
+    self.buf = bytearray(21)
     self.buf[0] = _DATA_REGISTER
+    self.calibration = None
+    if verify:
+      self.verify()
     self.setup()
+
+  def verify(self) -> None:
+    if self.chip_id != QMC5883L_CHIP_ID:
+      raise RuntimeError('Failed to find QMC5883L. Check address or chip type.')
 
   def setup(self) -> None:
     with self.i2c_device as device:
@@ -131,29 +161,89 @@ class QMC5883L:
     self._int_enb = not value
 
   @property
-  def sensitivity(self) -> int:
-    try:
-      return SENSITIVITY_VALUES[self.range]
-    except KeyError:
-      raise AttributeError
+  def gain(self) -> int:
+    return GAIN_VALUES[self.range]
 
   @property
-  def magnetic_raw(self) -> tuple[int, int, int]:
-    if self.data_ready and not self.data_overflow:
+  def overflow(self) -> bool:
+    """
+    Whether the last measurement was an overflow.
+    """
+    return bool(self.buf[_STATUS_IDX] & STATUS_OVL_BIT)
+
+  @property
+  def magnetic(self) -> tuple[float, float, float]:
+    """
+    The measurement values (X, Y, Z) in Gauss units with calibration
+    offsets applied.
+    """
+    s = 1 / self.gain
+    raw = self._magnetic_raw
+    offset, scale = self.calibration
+    return (
+      (raw[0] * s - offset[0]) * scale[0],
+      (raw[1] * s - offset[1]) * scale[1],
+      (raw[2] * s - offset[2]) * scale[2])
+
+  @property
+  def _magnetic_raw(self) -> tuple[int, int, int]:
+    if self.data_ready:
       with self.i2c_device as device:
         device.write_then_readinto(
           self.buf,
           self.buf,
           out_end=1,
-          in_start=1)
+          in_start=1,
+          in_end=8)
     return struct.unpack_from(_DATA_FORMAT, self.buf, 1)
 
   @property
-  def magnetic_gauss(self) -> tuple[float, float, float]:
-    scale = 1 / self.sensitivity
-    return tuple(x * scale for x in self.magnetic_raw)
+  def flags(self) -> int:
+    return self.buf[_FLAGS_IDX]
 
   @property
-  def magnetic_ut(self) -> tuple[float, float, float]:
-    scale = MICROTESLAS_PER_GAUSS
-    return tuple(x * scale for x in self.magnetic_gauss)
+  def calibrated(self) -> bool:
+    """
+    True if the calibration data has been set.
+    """
+    return bool(self.flags & FLAG_CALIBRATED)
+
+  @property
+  def calibration(self) -> tuple[tuple[float, float, float], tuple[float, float, float]]:
+    """
+    The current calibration data as ((off_x, off_y, off_z), (scale_x, scale_y, scale_z)).
+    Use this to save/restore calibration without re-running min/max routines.
+    """
+    return (
+      struct.unpack_from('<3e', self.buf, _CALIB_IDX),
+      struct.unpack_from('<3e', self.buf, _CALIB_IDX+6))
+
+  @calibration.setter
+  def calibration(self, data: tuple[tuple[float, float, float], tuple[float, float, float]]|None) -> None:
+    if data is None:
+      struct.pack_into('<6e', self.buf, _CALIB_IDX, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0)
+      self.buf[_FLAGS_IDX] &= ~FLAG_CALIBRATED
+    else:
+      offset, scale = data
+      struct.pack_into('<6e', self.buf, _CALIB_IDX, *offset, *scale)
+      self.buf[_FLAGS_IDX] |= FLAG_CALIBRATED
+
+  def calibrate(self, xmin: float, xmax: float, ymin: float, ymax: float, zmin: float, zmax: float) -> None:
+    """
+    Corrects for local magnetic interference (metal, batteries) using 
+    the minimum and maximum Gauss values observed while rotating the 
+    sensor through all possible orientations.
+    """
+    # 1. Hard-Iron Offset: The center of the sphere
+    offset = (
+      (xmax + xmin) / 2,
+      (ymax + ymin) / 2,
+      (zmax + zmin) / 2)
+    # 2. Soft-Iron Scale: Makes the sphere perfectly round
+    # Calculate the range (width) of each axis
+    dx, dy, dz = (xmax - xmin), (ymax - ymin), (zmax - zmin)
+    if dx <= 0 or dy <= 0 or dz <= 0:
+      raise ValueError('Non-positive axis width')
+    avg_d = (dx + dy + dz) / 3
+    scale = (avg_d / dx, avg_d / dy, avg_d / dz)
+    self.calibration = offset, scale
