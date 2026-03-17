@@ -58,7 +58,7 @@ try:
 except ImportError:
   pass
 
-__version__ = '0.0.2'
+__version__ = '0.0.3'
 __repo__ = 'https://github.com/owings1/qmc5883l_circuitpython'
 
 QMC5883L_DEFAULT_ADDRESS = const(0x0D)
@@ -214,9 +214,7 @@ class QMC5883L:
     The current calibration data as ((off_x, off_y, off_z), (scale_x, scale_y, scale_z)).
     Use this to save/restore calibration without re-running min/max routines.
     """
-    return (
-      struct.unpack_from('<3e', self.buf, _CALIB_IDX),
-      struct.unpack_from('<3e', self.buf, _CALIB_IDX+6))
+    return (self.offset, self.scale)
 
   @calibration.setter
   def calibration(self, data: tuple[tuple[float, float, float], tuple[float, float, float]]|None) -> None:
@@ -227,6 +225,14 @@ class QMC5883L:
       offset, scale = data
       struct.pack_into('<6e', self.buf, _CALIB_IDX, *offset, *scale)
       self.buf[_FLAGS_IDX] |= FLAG_CALIBRATED
+
+  @property
+  def offset(self) -> tuple[float, float, float]:
+    return struct.unpack_from('<3e', self.buf, _CALIB_IDX)
+
+  @property
+  def scale(self) -> tuple[float, float, float]:
+    return struct.unpack_from('<3e', self.buf, _CALIB_IDX+6)
 
   def calibrate(self, xmin: float, xmax: float, ymin: float, ymax: float, zmin: float, zmax: float) -> None:
     """
@@ -247,3 +253,17 @@ class QMC5883L:
     avg_d = (dx + dy + dz) / 3
     scale = (avg_d / dx, avg_d / dy, avg_d / dz)
     self.calibration = offset, scale
+
+  # Memory optimizations
+  del range.buffer
+  range.buffer = osr.buffer
+  del odr.buffer
+  odr.buffer = osr.buffer
+  del mode.buffer
+  mode.buffer = osr.buffer
+  del data_overflow.buffer
+  data_overflow.buffer = data_ready.buffer
+  del data_skip.buffer
+  data_skip.buffer = data_ready.buffer
+  del _do_soft_reset.buffer
+  _do_soft_reset.buffer = _int_enb.buffer
